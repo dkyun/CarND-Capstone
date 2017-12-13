@@ -1,39 +1,44 @@
-import rospy
+# Many thanks to Daniel Stang for his great guide
+# https://medium.com/@WuStangDan/step-by-step-tensorflow-object-detection-api-tutorial-part-1-selecting-a-model-a02b6aabe39e
+# The following code was created using the above guide and the tensorflow example notebook
+# https://github.com/tensorflow/models/blob/master/research/object_detection/object_detection_tutorial.ipynb
+
 from styx_msgs.msg import TrafficLightState
+import os
 import numpy as np
-from keras.models import model_from_json
-from keras import backend as K
-import cv2
-from cv_bridge import CvBridge, CvBridgeError
-from scipy import misc
-from time import time
+import tensorflow as tf
+from utils import label_map_util
 
 class TLClassifier(object):
     def __init__(self):
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        model = current_dir + '/ssd_inception_v2_coco/frozen_inference_graph.pb'
+        labels_file = current_dir + '/label_map.pbtxt'
+        num_classes = 4
 
-        # clear TF graph state
-	     
-	K.clear_session()
-	
-        model_arch_path = 'keras_model/squeezenet_transfer_learned_architecture.json'
-        model_weights_path = 'keras_model/squeezenet_transfer_learned_weights.h5'
+        label_map = label_map_util.load_labelmap(labels_file)
+        categories = label_map_util.convert_label_map_to_categories(label_map, max_num_classes=num_classes,
+                                                                    use_display_name=True)
+        self.category_index = label_map_util.create_category_index(categories)
 
-        # load keras model architecture
-        json_file = open(model_arch_path)
-        loaded_model_json = json_file.read()
-        json_file.close()
-        self.model = model_from_json(loaded_model_json)
-        self.model._make_predict_function()
+        self.detection_graph = tf.Graph()
+        with self.detection_graph.as_default():
+            od_graph_def = tf.GraphDef()
+            # Works up to here.
+            with tf.gfile.GFile(model, 'rb') as fid:
+                serialized_graph = fid.read()
+                od_graph_def.ParseFromString(serialized_graph)
+                tf.import_graph_def(od_graph_def, name='')
+            self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
+            self.d_boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
+            self.d_scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
+            self.d_classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
+            self.num_d = self.detection_graph.get_tensor_by_name('num_detections:0')
+            self.sess = tf.Session(graph=self.detection_graph)
 
-        # load weights into model
-        self.model.load_weights(model_weights_path)
-        rospy.logwarn('Perception keras model loaded')
-	self.bridge = CvBridge()
-
-	#self.frame_count = 0
+        print("Loaded frozen model graph")
 
     def get_classification(self, image):
-
         """Determines the color of the traffic light in the image
 
         Args:
@@ -42,29 +47,32 @@ class TLClassifier(object):
         Returns:
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
 
-	"""
-	# resize OpenCV image to (227, x)
-	tic1 = time()
-	org_width, org_height = (600.0, 800.0)
-	resize_width, resize_height = (227, 227)
-	scale = resize_height / org_width
-	resized_img = cv2.resize(image, (resize_width,resize_height), fx=scale, fy=scale)
+        """
 
-	# crop image to (227,227) image
-	cropped_img = resized_img[0:227, 0:227]/255.0
+        image_expanded = np.expand_dims(image, axis=0)
+        with self.detection_graph.as_default():
+            (boxes, scores, classes, num) = self.sess.run(
+                [self.d_boxes, self.d_scores,
+                 self.d_classes, self.num_d],
+                feed_dict={self.image_tensor: image_expanded})
 
-	
-	tic = time()
-	prediction = self.model.predict(np.array([cropped_img]))[0]
-	toc = time()
-	rospy.logwarn('Inference Time - ' + str(toc-tic))
-	prediction_labels = [TrafficLightState.GREEN, TrafficLightState.RED, TrafficLightState.YELLOW, TrafficLightState.UNKNOWN]
-	labels_names = ['GREEN', 'RED', 'YELLOW', 'UNKNOWN']
+        boxes = np.squeeze(boxes)
+        scores = np.squeeze(scores)
+        classes = np.squeeze(classes).astype(np.int32)
 
+        light_state = TrafficLightState.UNKNOWN
 
+        score_threshold = .50
+        for i in range(boxes.shape[0]):
+            if scores is None or scores[i] > score_threshold:
 
-	light_state = prediction_labels[prediction.argmax()]
+                class_name = self.category_index[classes[i]]['name']
 
-	rospy.logwarn('Traffic Light Prediction - ' + labels_names[prediction.argmax()])
-	return light_state
+                if class_name == 'Red':
+                    light_state = TrafficLightState.RED
+                elif class_name == 'Green':
+                    light_state = TrafficLightState.GREEN
+                elif class_name == 'Yellow':
+                    light_state = TrafficLightState.YELLOW
 
+        return light_state
